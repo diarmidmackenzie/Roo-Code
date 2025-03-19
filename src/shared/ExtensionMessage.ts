@@ -178,6 +178,7 @@ export interface ClineSayTool {
 		| "appliedDiff"
 		| "newFileCreated"
 		| "readFile"
+		| "fetchInstructions"
 		| "listFilesTopLevel"
 		| "listFilesRecursive"
 		| "listCodeDefinitionNames"
@@ -192,6 +193,7 @@ export interface ClineSayTool {
 	filePattern?: string
 	mode?: string
 	reason?: string
+	text?: string
 }
 
 // Must keep in sync with system prompt.
