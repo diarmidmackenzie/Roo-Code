@@ -194,6 +194,7 @@ export interface ClineSayTool {
 	mode?: string
 	reason?: string
 	text?: string
+	task?: string
 }
 
 // Must keep in sync with system prompt.

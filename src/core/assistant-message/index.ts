@@ -59,6 +59,7 @@ export const toolParamNames = [
 	"message",
 	"cwd",
 	"follow_up",
+	"task",
 ] as const
 
 export type ToolParamName = (typeof toolParamNames)[number]
@@ -84,7 +85,7 @@ export interface ReadFileToolUse extends ToolUse {
 
 export interface FetchInstructionsToolUse extends ToolUse {
 	name: "fetch_instructions"
-	params: Partial<Pick<Record<ToolParamName, string>, "text">>
+	params: Partial<Pick<Record<ToolParamName, string>, "task">>
 }
 
 export interface WriteToFileToolUse extends ToolUse {
