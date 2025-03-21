@@ -4,7 +4,7 @@ import { formatResponse } from "../responses"
 import { RooIgnoreController, LOCK_TEXT_SYMBOL } from "../../ignore/RooIgnoreController"
 import { fileExistsAtPath } from "../../../utils/fs"
 import * as fs from "fs/promises"
-import { unixLike } from "./utils"
+import { toPosix } from "./utils"
 
 // Mock dependencies
 jest.mock("../../../utils/fs")
@@ -84,7 +84,7 @@ describe("RooIgnore Response Formatting", () => {
 				return (
 					!filePath.includes("node_modules") &&
 					!filePath.includes(".git") &&
-					!unixLike(filePath).includes("secrets/")
+					!toPosix(filePath).includes("secrets/")
 				)
 			})
 
@@ -128,7 +128,7 @@ describe("RooIgnore Response Formatting", () => {
 				return (
 					!filePath.includes("node_modules") &&
 					!filePath.includes(".git") &&
-					!unixLike(filePath).includes("secrets/")
+					!toPosix(filePath).includes("secrets/")
 				)
 			})
 
