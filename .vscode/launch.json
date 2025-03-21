@@ -24,6 +24,19 @@
 				"group": "tasks",
 				"order": 1
 			}
+		},
+		{
+			"name": "Debug Jest Tests",
+			"type": "node",
+			"request": "launch",
+			"runtimeArgs": [
+				"--inspect-brk",
+				"${workspaceRoot}/node_modules/jest/bin/jest.js",
+				"--runInBand",
+				"src/integrations/workspace"
+			],
+			"console": "integratedTerminal",
+			"internalConsoleOptions": "neverOpen"
 		}
 	]
 }

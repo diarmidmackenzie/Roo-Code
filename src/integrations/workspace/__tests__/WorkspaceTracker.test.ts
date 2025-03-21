@@ -3,6 +3,12 @@ import WorkspaceTracker from "../WorkspaceTracker"
 import { ClineProvider } from "../../../core/webview/ClineProvider"
 import { listFiles } from "../../../services/glob/list-files"
 import { getWorkspacePath } from "../../../utils/path"
+import path from "path"
+import { PathLike } from "fs"
+
+function normalize(filePath: PathLike) {
+	return path.resolve("/test/workspace", filePath.toString())
+}
 
 // Mock functions - must be defined before jest.mock calls
 const mockOnDidCreate = jest.fn()
@@ -88,9 +94,11 @@ describe("WorkspaceTracker", () => {
 		await workspaceTracker.initializeFilePaths()
 		jest.runAllTimers()
 
+		const filePaths = ["file1.ts", "file2.ts"]
+		const normalizedFilePaths = filePaths.map(normalize)
 		expect(mockProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "workspaceUpdated",
-			filePaths: expect.arrayContaining(["file1.ts", "file2.ts"]),
+			filePaths: expect.arrayContaining(normalizedFilePaths),
 			openedTabs: [],
 		})
 		expect((mockProvider.postMessageToWebview as jest.Mock).mock.calls[0][0].filePaths).toHaveLength(2)
@@ -104,7 +112,7 @@ describe("WorkspaceTracker", () => {
 
 		expect(mockProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "workspaceUpdated",
-			filePaths: ["newfile.ts"],
+			filePaths: [normalize("newfile.ts")],
 			openedTabs: [],
 		})
 	})
@@ -112,12 +120,14 @@ describe("WorkspaceTracker", () => {
 	it("should handle file deletion events", async () => {
 		// First add a file
 		const [[createCallback]] = mockOnDidCreate.mock.calls
-		await createCallback({ fsPath: "/test/workspace/file.ts" })
+		const filePath = "/test/workspace/file.ts"
+		const normalizedFilePath = normalize(filePath)
+		await createCallback({ fsPath: normalizedFilePath })
 		jest.runAllTimers()
 
 		// Then delete it
 		const [[deleteCallback]] = mockOnDidDelete.mock.calls
-		await deleteCallback({ fsPath: "/test/workspace/file.ts" })
+		await deleteCallback({ fsPath: normalizedFilePath })
 		jest.runAllTimers()
 
 		// The last call should have empty filePaths
@@ -138,7 +148,7 @@ describe("WorkspaceTracker", () => {
 
 		expect(mockProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "workspaceUpdated",
-			filePaths: expect.arrayContaining(["newdir"]),
+			filePaths: expect.arrayContaining([normalize("newdir")]),
 			openedTabs: [],
 		})
 		const lastCall = (mockProvider.postMessageToWebview as jest.Mock).mock.calls.slice(-1)[0]
@@ -155,11 +165,12 @@ describe("WorkspaceTracker", () => {
 
 		// Should only have 1000 files initially
 		const expectedFiles = Array.from({ length: 1000 }, (_, i) => `file${i}.ts`).sort()
+		const normalizedExpectedFiles = expectedFiles.map(normalize)
 		const calls = (mockProvider.postMessageToWebview as jest.Mock).mock.calls
 
 		expect(mockProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "workspaceUpdated",
-			filePaths: expect.arrayContaining(expectedFiles),
+			filePaths: expect.arrayContaining(normalizedExpectedFiles),
 			openedTabs: [],
 		})
 		expect(calls[0][0].filePaths).toHaveLength(1000)
@@ -267,8 +278,10 @@ describe("WorkspaceTracker", () => {
 		jest.runAllTimers()
 
 		// Should not update file paths because workspace changed during initialization
+		const filePaths = ["/test/workspace/file1.ts", "/test/workspace/file2.ts"]
+		const normalizedFilePaths = filePaths.map(normalize)
 		expect(mockProvider.postMessageToWebview).toHaveBeenCalledWith({
-			filePaths: ["/test/workspace/file1.ts", "/test/workspace/file2.ts"],
+			filePaths: normalizedFilePaths,
 			openedTabs: [],
 			type: "workspaceUpdated",
 		})
