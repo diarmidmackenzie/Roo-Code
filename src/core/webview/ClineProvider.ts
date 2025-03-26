@@ -1558,6 +1558,7 @@ export class ClineProvider extends EventEmitter<ClineProviderEvents> implements 
 							t("common:confirmation.just_this_message"),
 							t("common:confirmation.this_and_subsequent"),
 						)
+<<<<<<< Updated upstream
 						if (
 							(answer === t("common:confirmation.just_this_message") ||
 								answer === t("common:confirmation.this_and_subsequent")) &&
@@ -1640,7 +1641,27 @@ export class ClineProvider extends EventEmitter<ClineProviderEvents> implements 
 								}
 
 								await this.initClineWithHistoryItem(historyItem)
+=======
+						
+						if (answer && this.getCurrentCline() && typeof message.value === "number" && message.value) {
+							const currentCline = this.getCurrentCline()!
+							const { historyItem } = await this.getTaskWithId(currentCline.taskId)
+							const messageTs = message.value
+
+							if (answer === "Just this message") {
+								await currentCline.getMessageService().deleteMessage(
+									currentCline.taskId,
+									messageTs
+								)
+							} else if (answer === "This and all subsequent messages") {
+								await currentCline.getMessageService().deleteMessageAndSubsequent(
+									currentCline.taskId,
+									messageTs
+								)
+>>>>>>> Stashed changes
 							}
+
+							await this.initClineWithHistoryItem(historyItem)
 						}
 						break
 					}

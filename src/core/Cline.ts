@@ -85,6 +85,12 @@ import { parseXml } from "../utils/xml"
 import { readLines } from "../integrations/misc/read-lines"
 import { getWorkspacePath } from "../utils/path"
 import { isBinaryFile } from "isbinaryfile"
+import { ApiService } from "../services/api/ApiService"
+import { FileSystemService } from "../services/filesystem/FileSystemService"
+import { MessageService } from "../services/message/MessageService"
+
+const cwd =
+	vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0) ?? path.join(os.homedir(), "Desktop") // may or may not exist but fs checking existence would immediately ask for permission which would be bad UX, need to come up with a better solution
 
 type ToolResponse = string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>
 type UserContent = Array<Anthropic.Messages.ContentBlockParam>
@@ -126,6 +132,15 @@ export class Cline extends EventEmitter<ClineEvents> {
 	get cwd() {
 		return getWorkspacePath(path.join(os.homedir(), "Desktop"))
 	}
+	private apiService: ApiService
+	private fileSystemService: FileSystemService
+	protected messageService: MessageService
+
+	// Add public getter for messageService
+	public getMessageService(): MessageService {
+		return this.messageService
+	}
+
 	// Subtasks
 	readonly rootTask: Cline | undefined = undefined
 	readonly parentTask: Cline | undefined = undefined
@@ -212,7 +227,16 @@ export class Cline extends EventEmitter<ClineEvents> {
 		this.instanceId = crypto.randomUUID().slice(0, 8)
 		this.taskNumber = -1
 		this.apiConfiguration = apiConfiguration
+		
+		// Initialize services
+		this.apiService = new ApiService()
+		this.apiService.initialize(apiConfiguration)
+		this.fileSystemService = new FileSystemService(cwd)
+		this.messageService = new MessageService(this.fileSystemService, cwd)
+		
+		// Keep the old api handler for backward compatibility during migration
 		this.api = buildApiHandler(apiConfiguration)
+		
 		this.urlContentFetcher = new UrlContentFetcher(provider.context)
 		this.browserSession = new BrowserSession(provider.context)
 		this.customInstructions = customInstructions
@@ -303,66 +327,53 @@ export class Cline extends EventEmitter<ClineEvents> {
 	}
 
 	private async getSavedApiConversationHistory(): Promise<Anthropic.MessageParam[]> {
-		const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.apiConversationHistory)
-		const fileExists = await fileExistsAtPath(filePath)
-		if (fileExists) {
-			return JSON.parse(await fs.readFile(filePath, "utf8"))
-		}
-		return []
+		return this.messageService.getApiMessages(this.taskId)
 	}
 
 	private async addToApiConversationHistory(message: Anthropic.MessageParam) {
 		const messageWithTs = { ...message, ts: Date.now() }
 		this.apiConversationHistory.push(messageWithTs)
-		await this.saveApiConversationHistory()
+		await this.messageService.addApiMessage(messageWithTs)
+		await this.apiService.updateConversationHistory(this.apiConversationHistory)
 	}
 
 	async overwriteApiConversationHistory(newHistory: Anthropic.MessageParam[]) {
 		this.apiConversationHistory = newHistory
-		await this.saveApiConversationHistory()
+		await this.messageService.addApiMessages(newHistory)
 	}
 
 	private async saveApiConversationHistory() {
 		try {
-			const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.apiConversationHistory)
-			await fs.writeFile(filePath, JSON.stringify(this.apiConversationHistory))
+			const taskDir = await this.ensureTaskDirectoryExists()
+			const historyPath = path.join(taskDir, "api-conversation-history.json")
+			await this.messageService.saveApiMessages(historyPath)
 		} catch (error) {
-			// in the off chance this fails, we don't want to stop the task
 			console.error("Failed to save API conversation history:", error)
 		}
 	}
 
 	private async getSavedClineMessages(): Promise<ClineMessage[]> {
-		const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.uiMessages)
-		if (await fileExistsAtPath(filePath)) {
-			return JSON.parse(await fs.readFile(filePath, "utf8"))
-		} else {
-			// check old location
-			const oldPath = path.join(await this.ensureTaskDirectoryExists(), "claude_messages.json")
-			if (await fileExistsAtPath(oldPath)) {
-				const data = JSON.parse(await fs.readFile(oldPath, "utf8"))
-				await fs.unlink(oldPath) // remove old file
-				return data
-			}
-		}
-		return []
+		return this.messageService.getMessages(this.taskId)
 	}
 
 	private async addToClineMessages(message: ClineMessage) {
 		this.clineMessages.push(message)
-		await this.providerRef.deref()?.postStateToWebview()
+		await this.messageService.addMessage(message)
 		this.emit("message", { action: "created", message })
-		await this.saveClineMessages()
 	}
 
 	public async overwriteClineMessages(newMessages: ClineMessage[]) {
 		this.clineMessages = newMessages
-		await this.saveClineMessages()
+		await this.messageService.addMessages(newMessages)
 	}
 
 	private async updateClineMessage(partialMessage: ClineMessage) {
-		await this.providerRef.deref()?.postMessageToWebview({ type: "partialMessage", partialMessage })
-		this.emit("message", { action: "updated", message: partialMessage })
+		const index = this.clineMessages.findIndex((m) => m.ts === partialMessage.ts)
+		if (index !== -1) {
+			this.clineMessages[index] = { ...this.clineMessages[index], ...partialMessage }
+			await this.messageService.updateMessage(partialMessage)
+			this.emit("message", { action: "updated", message: this.clineMessages[index] })
+		}
 	}
 
 	private getTokenUsage() {
@@ -374,150 +385,55 @@ export class Cline extends EventEmitter<ClineEvents> {
 	private async saveClineMessages() {
 		try {
 			const taskDir = await this.ensureTaskDirectoryExists()
-			const filePath = path.join(taskDir, GlobalFileNames.uiMessages)
-			await fs.writeFile(filePath, JSON.stringify(this.clineMessages))
-			// combined as they are in ChatView
-			const apiMetrics = this.getTokenUsage()
-			const taskMessage = this.clineMessages[0] // first message is always the task say
-			const lastRelevantMessage =
-				this.clineMessages[
-					findLastIndex(
-						this.clineMessages,
-						(m) => !(m.ask === "resume_task" || m.ask === "resume_completed_task"),
-					)
-				]
-
-			let taskDirSize = 0
-
-			try {
-				taskDirSize = await getFolderSize.loose(taskDir)
-			} catch (err) {
-				console.error(
-					`[saveClineMessages] failed to get task directory size (${taskDir}): ${err instanceof Error ? err.message : String(err)}`,
-				)
-			}
-
-			await this.providerRef.deref()?.updateTaskHistory({
-				id: this.taskId,
-				number: this.taskNumber,
-				ts: lastRelevantMessage.ts,
-				task: taskMessage.text ?? "",
-				tokensIn: apiMetrics.totalTokensIn,
-				tokensOut: apiMetrics.totalTokensOut,
-				cacheWrites: apiMetrics.totalCacheWrites,
-				cacheReads: apiMetrics.totalCacheReads,
-				totalCost: apiMetrics.totalCost,
-				size: taskDirSize,
-			})
+			const messagesPath = path.join(taskDir, "cline-messages.json")
+			await this.messageService.saveMessages(messagesPath)
 		} catch (error) {
-			console.error("Failed to save cline messages:", error)
+			console.error("Failed to save Cline messages:", error)
 		}
 	}
 
 	// Communicate with webview
 
-	// partial has three valid states true (partial message), false (completion of partial message), undefined (individual complete message)
 	async ask(
 		type: ClineAsk,
 		text?: string,
 		partial?: boolean,
 		progressStatus?: ToolProgressStatus,
 	): Promise<{ response: ClineAskResponse; text?: string; images?: string[] }> {
-		// If this Cline instance was aborted by the provider, then the only
-		// thing keeping us alive is a promise still running in the background,
-		// in which case we don't want to send its result to the webview as it
-		// is attached to a new instance of Cline now. So we can safely ignore
-		// the result of any active promises, and this class will be
-		// deallocated. (Although we set Cline = undefined in provider, that
-		// simply removes the reference to this instance, but the instance is
-		// still alive until this promise resolves or rejects.)
 		if (this.abort) {
 			throw new Error(`[Cline#ask] task ${this.taskId}.${this.instanceId} aborted`)
 		}
 
-		let askTs: number
+		let askTs = Date.now()
+		this.lastMessageTs = askTs
 
-		if (partial !== undefined) {
-			const lastMessage = this.clineMessages.at(-1)
-			const isUpdatingPreviousPartial =
-				lastMessage && lastMessage.partial && lastMessage.type === "ask" && lastMessage.ask === type
-			if (partial) {
-				if (isUpdatingPreviousPartial) {
-					// Existing partial message, so update it.
-					lastMessage.text = text
-					lastMessage.partial = partial
-					lastMessage.progressStatus = progressStatus
-					// TODO: Be more efficient about saving and posting only new
-					// data or one whole message at a time so ignore partial for
-					// saves, and only post parts of partial message instead of
-					// whole array in new listener.
-					this.updateClineMessage(lastMessage)
-					throw new Error("Current ask promise was ignored (#1)")
-				} else {
-					// This is a new partial message, so add it with partial
-					// state.
-					askTs = Date.now()
-					this.lastMessageTs = askTs
-					await this.addToClineMessages({ ts: askTs, type: "ask", ask: type, text, partial })
-					throw new Error("Current ask promise was ignored (#2)")
-				}
-			} else {
-				if (isUpdatingPreviousPartial) {
-					// This is the complete version of a previously partial
-					// message, so replace the partial with the complete version.
-					this.askResponse = undefined
-					this.askResponseText = undefined
-					this.askResponseImages = undefined
+		const message: ClineMessage = { 
+			ts: askTs, 
+			type: "ask", 
+			ask: type, 
+			text,
+			progressStatus 
+		}
 
-					/*
-					Bug for the history books:
-					In the webview we use the ts as the chatrow key for the virtuoso list. Since we would update this ts right at the end of streaming, it would cause the view to flicker. The key prop has to be stable otherwise react has trouble reconciling items between renders, causing unmounting and remounting of components (flickering).
-					The lesson here is if you see flickering when rendering lists, it's likely because the key prop is not stable.
-					So in this case we must make sure that the message ts is never altered after first setting it.
-					*/
-					askTs = lastMessage.ts
-					this.lastMessageTs = askTs
-					// lastMessage.ts = askTs
-					lastMessage.text = text
-					lastMessage.partial = false
-					lastMessage.progressStatus = progressStatus
-					await this.saveClineMessages()
-					this.updateClineMessage(lastMessage)
-				} else {
-					// This is a new and complete message, so add it like normal.
-					this.askResponse = undefined
-					this.askResponseText = undefined
-					this.askResponseImages = undefined
-					askTs = Date.now()
-					this.lastMessageTs = askTs
-					await this.addToClineMessages({ ts: askTs, type: "ask", ask: type, text })
-				}
+		await this.messageService.handlePartialMessage(this.taskId, message, !partial)
+
+		if (!partial) {
+			await pWaitFor(() => this.askResponse !== undefined || this.lastMessageTs !== askTs, { interval: 100 })
+
+			if (this.lastMessageTs !== askTs) {
+				throw new Error("Current ask promise was ignored (#3)")
 			}
-		} else {
-			// This is a new non-partial message, so add it like normal.
+
+			const response = this.askResponse!
 			this.askResponse = undefined
-			this.askResponseText = undefined
-			this.askResponseImages = undefined
-			askTs = Date.now()
-			this.lastMessageTs = askTs
-			await this.addToClineMessages({ ts: askTs, type: "ask", ask: type, text })
+			return {
+				response,
+				text: this.askResponseText,
+				images: this.askResponseImages
+			}
 		}
 
-		await pWaitFor(() => this.askResponse !== undefined || this.lastMessageTs !== askTs, { interval: 100 })
-
-		if (this.lastMessageTs !== askTs) {
-			// Could happen if we send multiple asks in a row i.e. with
-			// command_output. It's important that when we know an ask could
-			// fail, it is handled gracefully.
-			throw new Error("Current ask promise was ignored")
-		}
-
-		const result = { response: this.askResponse!, text: this.askResponseText, images: this.askResponseImages }
-		this.askResponse = undefined
-		this.askResponseText = undefined
-		this.askResponseImages = undefined
-		this.emit("taskAskResponded")
-		return result
+		throw new Error("Current ask promise was ignored (#4)")
 	}
 
 	async handleWebviewAskResponse(askResponse: ClineAskResponse, text?: string, images?: string[]) {
@@ -538,53 +454,18 @@ export class Cline extends EventEmitter<ClineEvents> {
 			throw new Error(`[Cline#say] task ${this.taskId}.${this.instanceId} aborted`)
 		}
 
-		if (partial !== undefined) {
-			const lastMessage = this.clineMessages.at(-1)
-			const isUpdatingPreviousPartial =
-				lastMessage && lastMessage.partial && lastMessage.type === "say" && lastMessage.say === type
-			if (partial) {
-				if (isUpdatingPreviousPartial) {
-					// existing partial message, so update it
-					lastMessage.text = text
-					lastMessage.images = images
-					lastMessage.partial = partial
-					lastMessage.progressStatus = progressStatus
-					this.updateClineMessage(lastMessage)
-				} else {
-					// this is a new partial message, so add it with partial state
-					const sayTs = Date.now()
-					this.lastMessageTs = sayTs
-					await this.addToClineMessages({ ts: sayTs, type: "say", say: type, text, images, partial })
-				}
-			} else {
-				// New now have a complete version of a previously partial message.
-				if (isUpdatingPreviousPartial) {
-					// This is the complete version of a previously partial
-					// message, so replace the partial with the complete version.
-					this.lastMessageTs = lastMessage.ts
-					// lastMessage.ts = sayTs
-					lastMessage.text = text
-					lastMessage.images = images
-					lastMessage.partial = false
-					lastMessage.progressStatus = progressStatus
-					// Instead of streaming partialMessage events, we do a save
-					// and post like normal to persist to disk.
-					await this.saveClineMessages()
-					// More performant than an entire postStateToWebview.
-					this.updateClineMessage(lastMessage)
-				} else {
-					// This is a new and complete message, so add it like normal.
-					const sayTs = Date.now()
-					this.lastMessageTs = sayTs
-					await this.addToClineMessages({ ts: sayTs, type: "say", say: type, text, images })
-				}
-			}
-		} else {
-			// this is a new non-partial message, so add it like normal
-			const sayTs = Date.now()
-			this.lastMessageTs = sayTs
-			await this.addToClineMessages({ ts: sayTs, type: "say", say: type, text, images, checkpoint })
+		const message: ClineMessage = {
+			ts: Date.now(),
+			type: "say",
+			say: type,
+			text,
+			images,
+			checkpoint,
+			progressStatus
 		}
+
+		await this.messageService.handlePartialMessage(this.taskId, message, !partial)
+		return undefined
 	}
 
 	async sayAndCreateMissingParamError(toolName: ToolUseName, paramName: string, relPath?: string) {
@@ -604,7 +485,13 @@ export class Cline extends EventEmitter<ClineEvents> {
 		// if the extension process were killed, then on restart the clineMessages might not be empty, so we need to set it to [] when we create a new Cline client (otherwise webview would show stale messages from previous session)
 		this.clineMessages = []
 		this.apiConversationHistory = []
-		await this.providerRef.deref()?.postStateToWebview()
+		await this.messageService.updateConversationState(this.taskId, {
+			isStreaming: false,
+			isPaused: false,
+			isWaitingForResponse: false,
+			currentTaskId: this.taskId
+		})
+		await this.messageService.postStateToWebview()
 
 		await this.say("text", task, images)
 		this.isInitialized = true
@@ -625,6 +512,7 @@ export class Cline extends EventEmitter<ClineEvents> {
 	async resumePausedTask(lastMessage?: string) {
 		// release this Cline instance from paused state
 		this.isPaused = false
+		await this.messageService.updateConversationState(this.taskId, { isPaused: false })
 		this.emit("taskUnpaused")
 
 		// fake an answer from the subtask that it has completed running and this is the result of what it has done
@@ -1088,6 +976,7 @@ export class Cline extends EventEmitter<ClineEvents> {
 	}
 
 	async *attemptApiRequest(previousApiReqIndex: number, retryAttempt: number = 0): ApiStream {
+<<<<<<< Updated upstream
 		let mcpHub: McpHub | undefined
 
 		const { mcpEnabled, alwaysApproveResubmit, requestDelaySeconds, rateLimitSeconds } =
@@ -1259,37 +1148,11 @@ export class Cline extends EventEmitter<ClineEvents> {
 					)
 					await delay(1000)
 				}
-
-				await this.say(
-					"api_req_retry_delayed",
-					`${errorMsg}\n\nRetry attempt ${retryAttempt + 1}\nRetrying now...`,
-					undefined,
-					false,
-				)
-
-				// delegate generator output from the recursive call with incremented retry count
-				yield* this.attemptApiRequest(previousApiReqIndex, retryAttempt + 1)
-				return
-			} else {
-				const { response } = await this.ask(
-					"api_req_failed",
-					error.message ?? JSON.stringify(serializeError(error), null, 2),
-				)
-				if (response !== "yesButtonClicked") {
-					// this will never happen since if noButtonClicked, we will clear current task, aborting this instance
-					throw new Error("API request failed")
-				}
-				await this.say("api_req_retried")
-				// delegate generator output from the recursive call
-				yield* this.attemptApiRequest(previousApiReqIndex)
-				return
 			}
+		} catch (error) {
+			// Maintain existing error handling
+			throw error
 		}
-
-		// no error, so we can continue to yield all remaining chunks
-		// (needs to be placed outside of try/catch since it we want caller to handle errors not with api_req_failed as that is reserved for first chunk failures only)
-		// this delegates to another generator or iterable object. In this case, it's saying "yield all remaining values from this iterator". This effectively passes along all subsequent chunks from the original stream.
-		yield* iterator
 	}
 
 	async presentAssistantMessage() {
@@ -3155,15 +3018,23 @@ export class Cline extends EventEmitter<ClineEvents> {
 								await delay(500)
 
 								const newCline = await provider.initClineWithTask(message, undefined, this)
+								await this.messageService.updateConversationState(this.taskId, {
+									isWaitingForResponse: true,
+									currentTaskId: newCline.taskId
+								})
 								this.emit("taskSpawned", newCline.taskId)
 
 								pushToolResult(
-									`Successfully created new task in ${targetMode.name} mode with message: ${message}`,
+									`Successfully created new task in ${targetMode.name} mode with message: ${message}`
 								)
 
 								// Set the isPaused flag to true so the parent
 								// task can wait for the sub-task to finish.
 								this.isPaused = true
+								await this.messageService.updateConversationState(this.taskId, {
+									isPaused: true,
+									isWaitingForResponse: true
+								})
 								this.emit("taskPaused")
 
 								break
@@ -3260,6 +3131,11 @@ export class Cline extends EventEmitter<ClineEvents> {
 								}
 
 								telemetryService.captureTaskCompleted(this.taskId)
+								await this.messageService.updateConversationState(this.taskId, {
+									isStreaming: false,
+									isPaused: false,
+									isWaitingForResponse: false
+								})
 								this.emit("taskCompleted", this.taskId, this.getTokenUsage())
 
 								if (this.parentTask) {
@@ -3456,7 +3332,7 @@ export class Cline extends EventEmitter<ClineEvents> {
 			request: userContent.map((block) => formatContentBlockToMarkdown(block)).join("\n\n"),
 		} satisfies ClineApiReqInfo)
 		await this.saveClineMessages()
-		await this.providerRef.deref()?.postStateToWebview()
+		await this.messageService.postStateToWebview()
 
 		try {
 			let cacheWriteTokens = 0
@@ -3494,37 +3370,14 @@ export class Cline extends EventEmitter<ClineEvents> {
 					await this.diffViewProvider.revertChanges() // closes diff view
 				}
 
-				// if last message is a partial we need to update and save it
-				const lastMessage = this.clineMessages.at(-1)
-				if (lastMessage && lastMessage.partial) {
-					// lastMessage.ts = Date.now() DO NOT update ts since it is used as a key for virtuoso list
-					lastMessage.partial = false
-					// instead of streaming partialMessage events, we do a save and post like normal to persist to disk
-					console.log("updating partial message", lastMessage)
-					// await this.saveClineMessages()
-				}
-
-				// Let assistant know their response was interrupted for when task is resumed
-				await this.addToApiConversationHistory({
-					role: "assistant",
-					content: [
-						{
-							type: "text",
-							text:
-								assistantMessage +
-								`\n\n[${
-									cancelReason === "streaming_failed"
-										? "Response interrupted by API Error"
-										: "Response interrupted by user"
-								}]`,
-						},
-					],
-				})
+				await this.messageService.handleStreamInterruption(
+					this.taskId, 
+					cancelReason === "streaming_failed" ? "API Error" : "User Interruption"
+				)
 
 				// update api_req_started to have cancelled and cost, so that we can display the cost of the partial stream
 				updateApiReqMsg(cancelReason, streamingFailedMessage)
-				await this.saveClineMessages()
-
+				
 				// signals to provider that it can retrieve the saved messages from disk, as abortTask can not be awaited on in nature
 				this.didFinishAbortingStream = true
 			}
@@ -3545,6 +3398,7 @@ export class Cline extends EventEmitter<ClineEvents> {
 			let assistantMessage = ""
 			let reasoningMessage = ""
 			this.isStreaming = true
+			await this.messageService.updateConversationState(this.taskId, { isStreaming: true })
 
 			try {
 				for await (const chunk of stream) {
@@ -3619,6 +3473,7 @@ export class Cline extends EventEmitter<ClineEvents> {
 				}
 			} finally {
 				this.isStreaming = false
+				await this.messageService.updateConversationState(this.taskId, { isStreaming: false })
 			}
 
 			// need to call here in case the stream was aborted
@@ -3641,7 +3496,8 @@ export class Cline extends EventEmitter<ClineEvents> {
 
 			updateApiReqMsg()
 			await this.saveClineMessages()
-			await this.providerRef.deref()?.postStateToWebview()
+			await this.messageService.updateConversationState(this.taskId, { isWaitingForResponse: true })
+			await this.messageService.postStateToWebview()
 
 			// now add to apiconversationhistory
 			// need to save assistant responses to file before proceeding to tool use since user can exit at any moment and we wouldn't be able to save the assistant's response
@@ -3662,6 +3518,7 @@ export class Cline extends EventEmitter<ClineEvents> {
 				// }
 
 				await pWaitFor(() => this.userMessageContentReady)
+				await this.messageService.updateConversationState(this.taskId, { isWaitingForResponse: false })
 
 				// if the model did not tool use, then we need to tell it to either use a tool or attempt_completion
 				const didToolUse = this.assistantMessageContent.some((block) => block.type === "tool_use")
